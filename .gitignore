@@ -1,0 +1,59 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Output files
+output/
+*.csv
+*.log
+
+# IDE and editor files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+.idea/
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.obj
+*.o
+
+# CUDA compiled files
+*.cubin
+*.ptx
+*.fatbin
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Profiling outputs
+*.ncu-rep
+*.nsys-rep
+*.nvvp
+*.qdrep
+
+# Debug files
+*.pdb
+*.ilk
+*.exp
+
+# Dependency files
+*.deps
+
+# Temp files
+.claude/
