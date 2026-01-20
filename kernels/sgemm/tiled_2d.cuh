@@ -18,17 +18,25 @@ __global__ void sgemm_tiled_2d_kernel(int M, int N, int K,
     const int tid = threadIdx.x;
     const int numThreads = blockDim.x;
 
+    // threadResults[TM][TN]는 크기가 컴파일 타임 상수, 컴파일러가 모든 인덱싱을 정적으로 해석
+    // 그러나 A, B, C처럼 글로벌 메모리에 존재하는 변수의 경우, 행 크기와 인덱스가 runtime에 결정
+    // 컴파일러가 2D 배열 주소 계산을 정적으로 생성할 수 없음
+    // 따라서 1D로 선언하고 커널에서 사용자가 명시적으로 주소 계산을 수행
+
     // Number of threads in each dimension of the thread tile grid
+    // 한 블록 당 N차원으로의 thread 갯수
     constexpr int numThreadsN = BN / TN;
 
     // Thread's tile position in the block output
+    // 블록 내에서 thread가 담당하는 TMxTN 타일의 시작 위치
     const int threadTileRow = (tid / numThreadsN) * TM;
     const int threadTileCol = (tid % numThreadsN) * TN;
 
     // Block position
+    // 현재 블록이 담당하는 출력 행렬의 시작/끝 위치
     const int blockRow = blockIdx.y * BM;
     const int blockCol = blockIdx.x * BN;
-
+    
     // Registers for accumulation
     float threadResults[TM][TN] = {{0.0f}};
 
@@ -36,16 +44,32 @@ __global__ void sgemm_tiled_2d_kernel(int M, int N, int K,
     float regA[TM];
     float regB[TN];
 
-    // Main loop over K
+    // Tile 1D:
+    // thread 당 출력 : TM
+    // thread 수 : (BM/TM) * BN
+    // register 수 : TM
+
+    // Tile 2D:
+    // thread 당 출력 : TM x TN (2D tile)
+    // thread 수 : (BM/TM) * (BN/TN)
+    // register 수 : TM * TN
+
+    // 기존 : A 재사용=1번, B 재사용=TM번
+    // 개선 : A 재사용=TN번, B 재사용=TM번
+    // B를 읽어서 TM번 재사용하던 Tile1D에서, A도 TN번 재사용하도록 개선한 버전
+
+    // Main loop over B
+    // K 차원으로 연산이 끝나야 온전한 output 얻을 수 있음
     for (int tileK = 0; tileK < K; tileK += BK) {
-        // Collaborative load of A tile to shared memory
-        for (int loadIdx = tid; loadIdx < BM * BK; loadIdx += numThreads) {
+        // collaborative load of A tile to SMEM
+        // SMEM 원소: BM*BK, thread 갯수: numThreads
+        for (int loadIdx = tid; loadIdx < BM * BK; loadIdx += numThreads) { // As를 1차원으로 펼쳤을 때의 idx
             int row = loadIdx / BK;
-            int col = loadIdx % BK;
+            int col = loadIdx % BK; // As 내에서의 row/col 복원
             int globalRow = blockRow + row;
-            int globalCol = tileK + col;
+            int globalCol = tileK + col; // col은 0부터 K까지 순차적으로 가져와야 함
             As[row][col] = (globalRow < M && globalCol < K) ?
-                           A[globalRow * K + globalCol] : 0.0f;
+                            A[globalRow * K + globalCol] : 0.0f;
         }
 
         // Collaborative load of B tile to shared memory
@@ -77,6 +101,7 @@ __global__ void sgemm_tiled_2d_kernel(int M, int N, int K,
             }
 
             // Outer product
+            // As의 column, Bs의 row를 읽어서 재사용성 증가
             #pragma unroll
             for (int tm = 0; tm < TM; tm++) {
                 #pragma unroll
@@ -121,6 +146,6 @@ inline void run_sgemm_tiled_2d(int M, int N, int K,
     dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
     sgemm_tiled_2d_kernel<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
-
+                
 }  // namespace kernels
 }  // namespace cudabench
