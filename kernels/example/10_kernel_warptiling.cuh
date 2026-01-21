@@ -10,11 +10,14 @@ constexpr int WARPSIZE = 32;
 
 namespace wt {
 
+// Load tiles from global memory to shared memory
+// A is transposed while loading for coalesced access later
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB>
 __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
                              float *As, float *Bs, int innerRowA, int innerColA,
                              int innerRowB, int innerColB) {
+  // Vectorized load A with transpose (strided loading)
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
     const float4 tmp = reinterpret_cast<const float4 *>(
         &A[(innerRowA + offset) * K + innerColA * 4])[0];
@@ -24,6 +27,7 @@ __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
     As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
 
+  // Vectorized load B (strided loading)
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
         &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
@@ -32,6 +36,7 @@ __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
   }
 }
 
+// Process tiles from shared memory (outer product accumulation)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
           const int TM, const int TN>
@@ -73,22 +78,27 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
 }  // namespace wt
 
 // Warp tiling SGEMM kernel
+// NOTE: Assumes M, N, K are multiples of block tile sizes (no boundary check)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
     sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                     float beta, float *C) {
-  const uint cRow = blockIdx.y;
-  const uint cCol = blockIdx.x;
+  // Block tile position
+  const uint blockRow = blockIdx.y;
+  const uint blockCol = blockIdx.x;
 
+  // Warp position within block tile
   const uint warpIdx = threadIdx.x / WARPSIZE;
   const uint warpCol = warpIdx % (BN / WN);
   const uint warpRow = warpIdx / (BN / WN);
 
+  // Warp subtile dimensions
   constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
   constexpr uint WSUBM = WM / WMITER;
   constexpr uint WSUBN = WN / WNITER;
 
+  // Thread position within warp
   const uint threadIdxInWarp = threadIdx.x % WARPSIZE;
   const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
@@ -96,10 +106,12 @@ __global__ void __launch_bounds__(NUM_THREADS)
   __shared__ float As[BM * BK];
   __shared__ float Bs[BK * BN];
 
-  A += cRow * BM * K;
-  B += cCol * BN;
-  C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+  // Advance pointers to block tile start
+  A += blockRow * BM * K;
+  B += blockCol * BN;
+  C += (blockRow * BM + warpRow * WM) * N + blockCol * BN + warpCol * WN;
 
+  // Thread position for vectorized loading (with striding)
   const uint innerRowA = threadIdx.x / (BK / 4);
   const uint innerColA = threadIdx.x % (BK / 4);
   constexpr uint rowStrideA = (NUM_THREADS * 4) / BK;
@@ -107,10 +119,12 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint innerColB = threadIdx.x % (BN / 4);
   constexpr uint rowStrideB = NUM_THREADS / (BN / 4);
 
+  // Per-thread results and register cache
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
   float regN[WNITER * TN] = {0.0f};
 
+  // Main loop over K dimension
   for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
     wt::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
@@ -123,6 +137,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     __syncthreads();
   }
 
+  // Write results to global memory (vectorized stores per warp subtile)
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
     for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
       float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;

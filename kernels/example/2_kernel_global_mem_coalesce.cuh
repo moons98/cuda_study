@@ -7,20 +7,23 @@ namespace cudabench {
 namespace kernels {
 
 // Global memory coalesced SGEMM
-// Thread indexing changed to improve memory access pattern
+// Uses 1D thread block, threadIdx.x % BLOCKSIZE -> col for coalesced access
 template <const uint BLOCKSIZE>
 __global__ void sgemm_global_mem_coalesce(int M, int N, int K, float alpha,
                                           const float *A, const float *B,
                                           float beta, float *C) {
-    const int cRow = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
-    const int cCol = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
+    // 1D thread block: threadIdx.x in [0, BLOCKSIZE*BLOCKSIZE)
+    // row: derived from threadIdx.x / BLOCKSIZE
+    // col: derived from threadIdx.x % BLOCKSIZE (consecutive threads -> consecutive cols)
+    const int row = blockIdx.x * BLOCKSIZE + (threadIdx.x / BLOCKSIZE);
+    const int col = blockIdx.y * BLOCKSIZE + (threadIdx.x % BLOCKSIZE);
 
-    if (cRow < M && cCol < N) {
+    if (row < M && col < N) {
         float tmp = 0.0f;
         for (int i = 0; i < K; ++i) {
-            tmp += A[cRow * K + i] * B[i * N + cCol];
+            tmp += A[row * K + i] * B[i * N + col];
         }
-        C[cRow * N + cCol] = alpha * tmp + beta * C[cRow * N + cCol];
+        C[row * N + col] = alpha * tmp + beta * C[row * N + col];
     }
 }
 

@@ -10,12 +10,14 @@ namespace kernels {
 
 namespace db2 {
 
+// Async load tiles from global memory to shared memory using cuda::memcpy_async
+// A is transposed while loading for coalesced access later
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB, typename T>
 __device__ void loadFromGmem(int N, int K, float *A, float *B, float *As,
                              float *Bs, int innerRowA, int innerColA,
                              int innerRowB, int innerColB, T &barrier) {
-
+  // Async load A with transpose (element by element for transpose)
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
     cuda::memcpy_async(&As[(innerColA * 4 + 0) * BM + innerRowA + offset],
                        &A[(innerRowA + offset) * K + innerColA * 4],
@@ -35,6 +37,7 @@ __device__ void loadFromGmem(int N, int K, float *A, float *B, float *As,
                        barrier);
   }
 
+  // Async load B (vectorized float4 loads)
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     cuda::memcpy_async(&Bs[(innerRowB + offset) * BN + innerColB * 4],
                        &B[(innerRowB + offset) * N + innerColB * 4],
@@ -43,6 +46,7 @@ __device__ void loadFromGmem(int N, int K, float *A, float *B, float *As,
   }
 }
 
+// Process tiles from shared memory (outer product accumulation)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
           const int TM, const int TN>
@@ -84,11 +88,14 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
 }  // namespace db2
 
 // Double buffering SGEMM kernel with async memcpy (version 2)
+// Uses cuda::memcpy_async and cuda::barrier for true async memory operations
+// NOTE: Assumes M, N, K are multiples of block tile sizes (no boundary check)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
     runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                              float *B, float beta, float *C) {
+  // Initialize cooperative groups and barriers for async operations
   auto block = cooperative_groups::this_thread_block();
   __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> frontBarrier;
   __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> backBarrier;
@@ -100,28 +107,35 @@ __global__ void __launch_bounds__(NUM_THREADS)
   }
   __syncthreads();
 
-  const uint cRow = blockIdx.y;
-  const uint cCol = blockIdx.x;
+  // Block tile position
+  const uint blockRow = blockIdx.y;
+  const uint blockCol = blockIdx.x;
 
+  // Warp position within block tile
   const uint warpIdx = threadIdx.x / WARPSIZE;
   const uint warpCol = warpIdx % (BN / WN);
   const uint warpRow = warpIdx / (BN / WN);
 
+  // Warp subtile dimensions
   constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
   constexpr uint WSUBM = WM / WMITER;
   constexpr uint WSUBN = WN / WNITER;
 
+  // Thread position within warp
   const uint threadIdxInWarp = threadIdx.x % WARPSIZE;
   const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
 
+  // Double buffer: 2x shared memory for overlapping load/compute
   __shared__ float As[2 * BM * BK];
   __shared__ float Bs[2 * BK * BN];
 
-  A += cRow * BM * K;
-  B += cCol * BN;
-  C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+  // Advance pointers to block tile start
+  A += blockRow * BM * K;
+  B += blockCol * BN;
+  C += (blockRow * BM + warpRow * WM) * N + blockCol * BN + warpCol * WN;
 
+  // Thread position for async loading (with striding)
   const uint innerRowA = threadIdx.x / (BK / 4);
   const uint innerColA = threadIdx.x % (BK / 4);
   constexpr uint rowStrideA = (NUM_THREADS * 4) / BK;
@@ -129,25 +143,29 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint innerColB = threadIdx.x % (BN / 4);
   constexpr uint rowStrideB = NUM_THREADS / (BN / 4);
 
+  // Per-thread results and register cache
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
   float regN[WNITER * TN] = {0.0f};
 
+  // Buffer index for double buffering
   int As_offset = 0;
   int Bs_offset = 0;
 
-  // Double-buffering: load first blocktile into SMEM
+  // Initial async load into first buffer
   db2::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
       N, K, A, B, As + As_offset * BM * BK, Bs + Bs_offset * BK * BN, innerRowA,
       innerColA, innerRowB, innerColB, (*frontBarrierPtr));
 
+  // Main loop: overlap loading next tile while processing current tile
   for (uint bkIdx = 0; bkIdx < K - BK; bkIdx += BK) {
-    // Double-buffering: load next blocktile into SMEM
+    // Async load next tile into back buffer
     db2::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A + BK, B + BK * N, As + (1 - As_offset) * BM * BK,
         Bs + (1 - Bs_offset) * BK * BN, innerRowA, innerColA, innerRowB,
         innerColB, (*backBarrierPtr));
 
+    // Wait for front buffer to be ready, then process
     (*frontBarrierPtr).arrive_and_wait();
     db2::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
         regM, regN, threadResults, As + As_offset * BM * BK,
@@ -156,6 +174,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     A += BK;
     B += BK * N;
 
+    // Swap buffers and barriers
     As_offset = 1 - As_offset;
     Bs_offset = 1 - Bs_offset;
     auto tmp = frontBarrierPtr;
@@ -165,13 +184,14 @@ __global__ void __launch_bounds__(NUM_THREADS)
     __syncthreads();
   }
 
-  // Compute the last blocktile
+  // Process the last tile
   (*frontBarrierPtr).arrive_and_wait();
   db2::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
       regM, regN, threadResults, As + As_offset * BM * BK,
       Bs + Bs_offset * BK * BN, warpRow, warpCol, threadRowInWarp,
       threadColInWarp);
 
+  // Write results to global memory (vectorized stores per warp subtile)
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
     for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
       float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;

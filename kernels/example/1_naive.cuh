@@ -10,15 +10,16 @@ namespace kernels {
 // Matrix sizes: MxK * KxN = MxN
 __global__ void sgemm_naive(int M, int N, int K, float alpha, const float *A,
                             const float *B, float beta, float *C) {
-    const uint x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint y = blockIdx.y * blockDim.y + threadIdx.y;
+    // row: M dimension, col: N dimension
+    const uint row = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint col = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x < M && y < N) {
+    if (row < M && col < N) {
         float tmp = 0.0f;
         for (int i = 0; i < K; ++i) {
-            tmp += A[x * K + i] * B[i * N + y];
+            tmp += A[row * K + i] * B[i * N + col];
         }
-        C[x * N + y] = alpha * tmp + beta * C[x * N + y];
+        C[row * N + col] = alpha * tmp + beta * C[row * N + col];
     }
 }
 

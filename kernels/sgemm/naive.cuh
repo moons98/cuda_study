@@ -4,7 +4,6 @@
 #include "utils/matrix.cuh"
 
 namespace cudabench {
-
 namespace kernels {
 
 // ┌─────────────────────────────────────────────────────────────────────────┐
@@ -24,7 +23,7 @@ namespace kernels {
 // └─────────────────────────────────────────────────────────────────────────┘
 
 // Naive SGEMM kernel - each thread computes one element of C
-__global__ void sgemm_naive_kernel(int M, int N, int K,
+__global__ void sgemm_naive(int M, int N, int K,
                                    float alpha, const float* A, const float* B,
                                    float beta, float* C) {
     int row = blockIdx.y * blockDim.y + threadIdx.y; // 전역 y좌표
@@ -62,7 +61,7 @@ inline void run_sgemm_naive(int M, int N, int K,
     kernel<<<gridDim, blockDim, sharedMemBytes, stream>>>(args);
     */
 
-    sgemm_naive_kernel<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    sgemm_naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
     }
 
 }

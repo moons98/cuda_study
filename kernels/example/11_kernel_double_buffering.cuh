@@ -8,12 +8,15 @@ namespace kernels {
 
 namespace db {
 
+// Load tiles from global memory to shared memory
+// A is transposed while loading for coalesced access later
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB>
 __device__ void loadFromGmem(const int N, const int K, float *A, float *B,
                              float *As, float *Bs, const int innerRowA,
                              const int innerColA, const int innerRowB,
                              const int innerColB) {
+  // Vectorized load A with transpose (strided loading)
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
     float4 tmp = reinterpret_cast<float4 *>(
         &A[(innerRowA + offset) * K + innerColA * 4])[0];
@@ -23,6 +26,7 @@ __device__ void loadFromGmem(const int N, const int K, float *A, float *B,
     As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
 
+  // Vectorized load B (strided loading)
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
         &Bs[(innerRowB + offset) * BN + innerColB * 4])[0] =
@@ -31,6 +35,7 @@ __device__ void loadFromGmem(const int N, const int K, float *A, float *B,
   }
 }
 
+// Process tiles from shared memory (outer product accumulation)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
           const int TM, const int TN>
@@ -72,36 +77,46 @@ processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
 }  // namespace db
 
 // Double buffering SGEMM kernel (version 1)
+// Overlaps memory loads with computation using two buffers
+// NOTE: Assumes M, N, K are multiples of block tile sizes (no boundary check)
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
     sgemmDoubleBuffering(const int M, const int N, const int K,
                          const float alpha, float *A, float *B, float beta,
                          float *C) {
-  const uint cRow = blockIdx.y;
-  const uint cCol = blockIdx.x;
+  // Block tile position
+  const uint blockRow = blockIdx.y;
+  const uint blockCol = blockIdx.x;
 
+  // Warp position within block tile
   const uint warpIdx = threadIdx.x / WARPSIZE;
   const uint warpCol = warpIdx % (BN / WN);
   const uint warpRow = warpIdx / (BN / WN);
 
+  // Warp subtile dimensions
   constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
   constexpr uint WSUBM = WM / WMITER;
   constexpr uint WSUBN = WN / WNITER;
 
+  // Thread position within warp
   const uint threadIdxInWarp = threadIdx.x % WARPSIZE;
   const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
 
+  // Double buffer: 2x shared memory for overlapping load/compute
   __shared__ float As[2 * BM * BK];
   __shared__ float Bs[2 * BK * BN];
 
+  // Split threads: half load, half compute
   bool doubleBufferIdx = threadIdx.x >= (NUM_THREADS / 2);
 
-  A += cRow * BM * K;
-  B += cCol * BN;
-  C += (cRow * BM + warpRow * WM) * N + cCol * BN + warpCol * WN;
+  // Advance pointers to block tile start
+  A += blockRow * BM * K;
+  B += blockCol * BN;
+  C += (blockRow * BM + warpRow * WM) * N + blockCol * BN + warpCol * WN;
 
+  // Thread position for vectorized loading (half threads)
   const uint innerRowA = (threadIdx.x % (NUM_THREADS / 2)) / (BK / 4);
   const uint innerColA = (threadIdx.x % (NUM_THREADS / 2)) % (BK / 4);
   constexpr uint rowStrideA = ((NUM_THREADS / 2) * 4) / BK;
@@ -109,16 +124,19 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint innerColB = (threadIdx.x % (NUM_THREADS / 2)) % (BN / 4);
   constexpr uint rowStrideB = (NUM_THREADS / 2) / (BN / 4);
 
+  // Per-thread results and register cache
   float threadResults[WMITER * TM * WNITER * TN] = {0.0f};
   float regM[WMITER * TM] = {0.0f};
   float regN[WNITER * TN] = {0.0f};
 
+  // Initial load into first buffer
   if (doubleBufferIdx == 0) {
     db::loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
         N, K, A, B, As, Bs, innerRowA, innerColA, innerRowB, innerColB);
   }
   __syncthreads();
 
+  // Main loop: process 2 tiles per iteration with double buffering
   for (uint bkIdx = 0; bkIdx < K; bkIdx += 2 * BK) {
     if (doubleBufferIdx == 0) {
       db::processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM,
@@ -165,6 +183,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
     __syncthreads();
   }
 
+  // Write results to global memory (vectorized stores per warp subtile)
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
     for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
       float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
